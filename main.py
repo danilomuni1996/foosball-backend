@@ -7,7 +7,7 @@ from pathlib import Path
 from models import Player, Match
 from db import init_db, engine
 import json
-from sqlalchemy import func  # per case-insensitive
+from sqlalchemy import func
 
 app = FastAPI(title="Foosball API")
 
@@ -20,7 +20,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Static per immagini
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(UPLOAD_DIR)), name="static")
@@ -79,11 +78,9 @@ def delete_player_by_id(player_id: int, session: Session = Depends(get_session))
     session.commit()
     return {"status": "ok", "deleted": {"id": p.id, "name": p.name}}
 
-# DELETE per NOME (case-insensitive; opzionale like= true per parziale)
-from sqlalchemy import func
 @app.delete("/players/by-name")
 def delete_player_by_name(
-    name: str,          # query param ?name=...
+    name: str,
     like: bool = False,
     session: Session = Depends(get_session)
 ):
@@ -147,25 +144,24 @@ def create_match(data: MatchIn, session: Session = Depends(get_session)):
     teamA = [players[data.teamA_attacker_id], players[data.teamA_goalkeeper_id]]
     teamB = [players[data.teamB_attacker_id], players[data.teamB_goalkeeper_id]]
 
-    avgA = sum(p.points for p in teamA) / 2
-    avgB = sum(p.points for p in teamB) / 2
-
-    base_win, base_lose = 3, 1
-    upset_gap = 5
-    bonus = 1
-
+    cappotto = (data.score_a == 6 and data.score_b == 0) or (data.score_a == 0 and data.score_b == 6)
     awarded: Dict[int, int] = {}
+
     if winner == "A":
         win_team, lose_team = teamA, teamB
-        underdog_win = avgA + upset_gap <= avgB
     else:
         win_team, lose_team = teamB, teamA
-        underdog_win = avgB + upset_gap <= avgA
 
-    for p in win_team:
-        awarded[p.id] = base_win + (bonus if underdog_win else 0)
-    for p in lose_team:
-        awarded[p.id] = base_lose
+    if cappotto:
+        for p in win_team:
+            awarded[p.id] = 4
+        for p in lose_team:
+            awarded[p.id] = -1
+    else:
+        for p in win_team:
+            awarded[p.id] = 3
+        for p in lose_team:
+            awarded[p.id] = 1
 
     for pid, pts in awarded.items():
         players[pid].points += pts
