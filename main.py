@@ -166,4 +166,43 @@ def create_match(data: MatchIn, session: Session = Depends(get_session)):
     m = Match(
         teamA_attacker_id=data.teamA_attacker_id,
         teamA_goalkeeper_id=data.teamA_goalkeeper_id,
-        teamB_attacker
+        teamB_attacker_id=data.teamB_attacker_id,
+        teamB_goalkeeper_id=data.teamB_goalkeeper_id,
+        score_a=data.score_a,
+        score_b=data.score_b,
+        winner_team=winner,
+        points_awarded=json.dumps(awarded),
+    )
+    session.add(m)
+    session.commit()
+    session.refresh(m)
+    return m
+
+@app.delete("/matches/{match_id}")
+def delete_match(match_id: int, session: Session = Depends(get_session)):
+    m = session.get(Match, match_id)
+    if not m:
+        raise HTTPException(status_code=404, detail="Match not found")
+    session.delete(m)
+    session.commit()
+    return {"status": "ok"}
+
+# ========== ADMIN RESET (opzionale) ==========
+
+@app.post("/admin/reset")
+def admin_reset(session: Session = Depends(get_session)):
+    # elimina tutte le partite
+    for m in session.exec(select(Match)).all():
+        session.delete(m)
+    session.commit()
+    # elimina foto e giocatori
+    for p in session.exec(select(Player)).all():
+        if getattr(p, "photo_url", None):
+            filename = p.photo_url.replace("/static/", "")
+            path = UPLOAD_DIR / filename
+            if path.exists():
+                try: path.unlink()
+                except Exception: pass
+        session.delete(p)
+    session.commit()
+    return {"players": 0, "matches": 0}
