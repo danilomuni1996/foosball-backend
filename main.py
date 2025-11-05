@@ -8,6 +8,7 @@ from models import Player, Match
 from db import init_db, engine
 import json
 from sqlalchemy import func
+from datetime import datetime
 
 app = FastAPI(title="Foosball API")
 
@@ -125,7 +126,8 @@ class MatchIn(SQLModel):
 
 @app.get("/matches", response_model=List[Match])
 def list_matches(session: Session = Depends(get_session)):
-    return session.exec(select(Match)).all()
+    # Ordina dal più recente e restituisci anche il match_id (che è il campo "id" della tabella)
+    return session.exec(select(Match).order_by(Match.created_at.desc())).all()
 
 @app.post("/matches", response_model=Match)
 def create_match(data: MatchIn, session: Session = Depends(get_session)):
@@ -176,6 +178,7 @@ def create_match(data: MatchIn, session: Session = Depends(get_session)):
         score_b=data.score_b,
         winner_team=winner,
         points_awarded=json.dumps(awarded),
+        created_at=datetime.utcnow(),
     )
     session.add(m)
     session.commit()
