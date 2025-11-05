@@ -8,10 +8,11 @@ from models import Player, Match
 from db import init_db, engine
 import json
 import os
+from sqlalchemy import func  # per case-insensitive
 
 app = FastAPI(title="Foosball API")
 
-# CORS (aperto per sviluppo)
+# CORS (sviluppo)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,7 +21,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Static per immagini caricate
+# Static per immagini
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(UPLOAD_DIR)), name="static")
@@ -63,22 +64,47 @@ def list_players(session: Session = Depends(get_session)):
     return session.exec(select(Player)).all()
 
 @app.delete("/players/{player_id}")
-def delete_player(player_id: int, session: Session = Depends(get_session)):
+def delete_player_by_id(player_id: int, session: Session = Depends(get_session)):
     p = session.get(Player, player_id)
     if not p:
         raise HTTPException(status_code=404, detail="Player not found")
-    # elimina file foto se presente
     if getattr(p, "photo_url", None):
         filename = p.photo_url.replace("/static/", "")
         path = UPLOAD_DIR / filename
         if path.exists():
-            try:
-                path.unlink()
-            except Exception:
-                pass
+            try: path.unlink()
+            except Exception: pass
     session.delete(p)
     session.commit()
-    return {"status": "ok"}
+    return {"status": "ok", "deleted": {"id": p.id, "name": p.name}}
+
+# DELETE per NOME (case-insensitive, esatto; opzionale like)
+@app.delete("/players/by-name")
+def delete_player_by_name(
+    name: str,          # query param ?name=...
+    like: bool = False, # se true usa match parziale
+    session: Session = Depends(get_session)
+):
+    cond = func.lower(Player.name) == name.lower() if not like \
+        else func.lower(Player.name).like(f"%{name.lower()}%")
+    players = session.exec(select(Player).where(cond)).all()
+    if not players:
+        raise HTTPException(status_code=404, detail="Player not found")
+    if len(players) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail={"multiple": [{"id": p.id, "name": p.name} for p in players]}
+        )
+    p = players[0]
+    if getattr(p, "photo_url", None):
+        filename = p.photo_url.replace("/static/", "")
+        path = UPLOAD_DIR / filename
+        if path.exists():
+            try: path.unlink()
+            except Exception: pass
+    session.delete(p)
+    session.commit()
+    return {"status": "ok", "deleted": {"id": p.id, "name": p.name}}
 
 # ========== LEADERBOARD ==========
 
@@ -98,3 +124,46 @@ class MatchIn(SQLModel):
 
 @app.post("/matches", response_model=Match)
 def create_match(data: MatchIn, session: Session = Depends(get_session)):
+    ids = [
+        data.teamA_attacker_id, data.teamA_goalkeeper_id,
+        data.teamB_attacker_id, data.teamB_goalkeeper_id,
+    ]
+    players = {
+        p.id: p
+        for p in session.exec(select(Player).where(Player.id.in_(ids))).all()
+    }
+    if len(players) != 4:
+        raise HTTPException(status_code=400, detail="Giocatori non validi")
+
+    winner = "A" if data.score_a > data.score_b else "B"
+    teamA = [players[data.teamA_attacker_id], players[data.teamA_goalkeeper_id]]
+    teamB = [players[data.teamB_attacker_id], players[data.teamB_goalkeeper_id]]
+
+    avgA = sum(p.points for p in teamA) / 2
+    avgB = sum(p.points for p in teamB) / 2
+
+    base_win, base_lose = 3, 1
+    upset_gap = 5
+    bonus = 1
+
+    awarded: Dict[int, int] = {}
+    if winner == "A":
+        win_team, lose_team = teamA, teamB
+        underdog_win = avgA + upset_gap <= avgB
+    else:
+        win_team, lose_team = teamB, teamA
+        underdog_win = avgB + upset_gap <= avgA
+
+    for p in win_team:
+        awarded[p.id] = base_win + (bonus if underdog_win else 0)
+    for p in lose_team:
+        awarded[p.id] = base_lose
+
+    for pid, pts in awarded.items():
+        players[pid].points += pts
+    session.add_all(players.values())
+
+    m = Match(
+        teamA_attacker_id=data.teamA_attacker_id,
+        teamA_goalkeeper_id=data.teamA_goalkeeper_id,
+        teamB_attacker
