@@ -126,7 +126,6 @@ class MatchIn(SQLModel):
 
 @app.get("/matches", response_model=List[Match])
 def list_matches(session: Session = Depends(get_session)):
-    # Ordina dal più recente e restituisci anche il match_id (che è il campo "id" della tabella)
     return session.exec(select(Match).order_by(Match.created_at.desc())).all()
 
 @app.post("/matches", response_model=Match)
@@ -198,11 +197,9 @@ def delete_match(match_id: int, session: Session = Depends(get_session)):
 
 @app.post("/admin/reset")
 def admin_reset(session: Session = Depends(get_session)):
-    # elimina tutte le partite
     for m in session.exec(select(Match)).all():
         session.delete(m)
     session.commit()
-    # elimina foto e giocatori
     for p in session.exec(select(Player)).all():
         if getattr(p, "photo_url", None):
             filename = p.photo_url.replace("/static/", "")
