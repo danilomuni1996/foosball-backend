@@ -7,7 +7,6 @@ from pathlib import Path
 from models import Player, Match
 from db import init_db, engine
 import json
-import os
 from sqlalchemy import func  # per case-insensitive
 
 app = FastAPI(title="Foosball API")
@@ -72,17 +71,20 @@ def delete_player_by_id(player_id: int, session: Session = Depends(get_session))
         filename = p.photo_url.replace("/static/", "")
         path = UPLOAD_DIR / filename
         if path.exists():
-            try: path.unlink()
-            except Exception: pass
+            try:
+                path.unlink()
+            except Exception:
+                pass
     session.delete(p)
     session.commit()
     return {"status": "ok", "deleted": {"id": p.id, "name": p.name}}
 
-# DELETE per NOME (case-insensitive, esatto; opzionale like)
+# DELETE per NOME (case-insensitive; opzionale like= true per parziale)
+from sqlalchemy import func
 @app.delete("/players/by-name")
 def delete_player_by_name(
     name: str,          # query param ?name=...
-    like: bool = False, # se true usa match parziale
+    like: bool = False,
     session: Session = Depends(get_session)
 ):
     cond = func.lower(Player.name) == name.lower() if not like \
@@ -100,8 +102,10 @@ def delete_player_by_name(
         filename = p.photo_url.replace("/static/", "")
         path = UPLOAD_DIR / filename
         if path.exists():
-            try: path.unlink()
-            except Exception: pass
+            try:
+                path.unlink()
+            except Exception:
+                pass
     session.delete(p)
     session.commit()
     return {"status": "ok", "deleted": {"id": p.id, "name": p.name}}
@@ -121,6 +125,10 @@ class MatchIn(SQLModel):
     teamB_goalkeeper_id: int
     score_a: int
     score_b: int
+
+@app.get("/matches", response_model=List[Match])
+def list_matches(session: Session = Depends(get_session)):
+    return session.exec(select(Match)).all()
 
 @app.post("/matches", response_model=Match)
 def create_match(data: MatchIn, session: Session = Depends(get_session)):
@@ -201,8 +209,10 @@ def admin_reset(session: Session = Depends(get_session)):
             filename = p.photo_url.replace("/static/", "")
             path = UPLOAD_DIR / filename
             if path.exists():
-                try: path.unlink()
-                except Exception: pass
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
         session.delete(p)
     session.commit()
     return {"players": 0, "matches": 0}
