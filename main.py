@@ -115,3 +115,15 @@ def create_match(data: MatchIn, session: Session = Depends(get_session)):
     )
     session.add(m); session.commit(); session.refresh(m)
     return m
+
+from fastapi import FastAPI
+from admin import router as admin_router
+from db import init_db
+
+app = FastAPI()
+init_db()
+
+# ... qui i tuoi endpoint esistenti /players, /matches, /leaderboard
+
+app.include_router(admin_router)
+
