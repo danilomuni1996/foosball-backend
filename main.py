@@ -8,6 +8,7 @@ from models import Player, Match
 from db import init_db, engine
 import json
 
+# UNICA istanza FastAPI
 app = FastAPI()
 
 # CORS aperto per test
@@ -33,6 +34,7 @@ def get_session():
 def root():
     return {"ok": True}
 
+# ========== ENDPOINT PUBBLICI ==========
 @app.post("/players", response_model=Player)
 async def create_player(
     name: str = Form(...),
@@ -115,15 +117,8 @@ def create_match(data: MatchIn, session: Session = Depends(get_session)):
     )
     session.add(m); session.commit(); session.refresh(m)
     return m
+# ========== FINE ENDPOINT PUBBLICI ==========
 
-from fastapi import FastAPI
+# Include SOLO il router admin, senza ricreare app
 from admin import router as admin_router
-from db import init_db
-
-app = FastAPI()
-init_db()
-
-# ... qui i tuoi endpoint esistenti /players, /matches, /leaderboard
-
 app.include_router(admin_router)
-
