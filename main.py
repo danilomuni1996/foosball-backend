@@ -37,6 +37,96 @@ def get_session():
 def root():
     return {"ok": True}
 
+# --------- helper: tabella punteggi materializzata ---------
+
+def ensure_scores_table(session: Session):
+    # Crea tabella players_scores se non esiste e inserisce le righe per i giocatori mancanti
+    session.exec(text("""
+        CREATE TABLE IF NOT EXISTS players_scores (
+            player_id INTEGER PRIMARY KEY REFERENCES players(id) ON DELETE CASCADE,
+            points INTEGER NOT NULL DEFAULT 0,
+            updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+    """))
+    session.exec(text("""
+        INSERT INTO players_scores (player_id, points, updated_at)
+        SELECT p.id, 0, NOW()
+        FROM players p
+        ON CONFLICT (player_id) DO NOTHING
+    """))
+    session.commit()
+
+def recompute_scores_tx(session: Session):
+    # Ricostruisce i punteggi da zero in una transazione aperta
+    ensure_scores_table(session)
+
+    # azzera
+    session.exec(text("UPDATE players_scores SET points = 0, updated_at = NOW()"))
+
+    # cappotto 6-0 vinto da Team A: +4 ai due di A, -1 ai due di B
+    session.exec(text("""
+        UPDATE players_scores ps
+        SET points = ps.points + 4, updated_at = NOW()
+        FROM matches m
+        WHERE m.score_a = 6 AND m.score_b = 0
+          AND ps.player_id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id)
+    """))
+    session.exec(text("""
+        UPDATE players_scores ps
+        SET points = ps.points - 1, updated_at = NOW()
+        FROM matches m
+        WHERE m.score_a = 6 AND m.score_b = 0
+          AND ps.player_id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id)
+    """))
+
+    # cappotto 0-6 vinto da Team B: +4 ai due di B, -1 ai due di A
+    session.exec(text("""
+        UPDATE players_scores ps
+        SET points = ps.points + 4, updated_at = NOW()
+        FROM matches m
+        WHERE m.score_b = 6 AND m.score_a = 0
+          AND ps.player_id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id)
+    """))
+    session.exec(text("""
+        UPDATE players_scores ps
+        SET points = ps.points - 1, updated_at = NOW()
+        FROM matches m
+        WHERE m.score_b = 6 AND m.score_a = 0
+          AND ps.player_id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id)
+    """))
+
+    # vittorie normali: +3 ai vincenti
+    session.exec(text("""
+        UPDATE players_scores ps
+        SET points = ps.points + 3, updated_at = NOW()
+        FROM matches m
+        WHERE m.score_a > m.score_b
+          AND ps.player_id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id)
+    """))
+    session.exec(text("""
+        UPDATE players_scores ps
+        SET points = ps.points + 3, updated_at = NOW()
+        FROM matches m
+        WHERE m.score_b > m.score_a
+          AND ps.player_id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id)
+    """))
+
+    # sconfitte normali: +1 ai perdenti
+    session.exec(text("""
+        UPDATE players_scores ps
+        SET points = ps.points + 1, updated_at = NOW()
+        FROM matches m
+        WHERE m.score_a < m.score_b
+          AND ps.player_id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id)
+    """))
+    session.exec(text("""
+        UPDATE players_scores ps
+        SET points = ps.points + 1, updated_at = NOW()
+        FROM matches m
+        WHERE m.score_b < m.score_a
+          AND ps.player_id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id)
+    """))
+
 # ========== PLAYERS ==========
 
 @app.post("/players", response_model=Player)
@@ -56,6 +146,16 @@ async def create_player(
     session.add(p)
     session.commit()
     session.refresh(p)
+
+    # assicurati che esista una riga in players_scores
+    ensure_scores_table(session)
+    session.exec(text("""
+        INSERT INTO players_scores (player_id, points, updated_at)
+        VALUES (:pid, 0, NOW())
+        ON CONFLICT (player_id) DO NOTHING
+    """), {"pid": p.id})
+    session.commit()
+
     return p
 
 @app.get("/players", response_model=List[Player])
@@ -108,58 +208,29 @@ def delete_player_by_name(
     session.commit()
     return {"status": "ok", "deleted": {"id": p.id, "name": p.name}}
 
-# ========== LEADERBOARD (ON-DEMAND) ==========
-
-from sqlalchemy import text
+# ========== LEADERBOARD (materializzata) ==========
 
 @app.get("/leaderboard")
 def leaderboard(session: Session = Depends(get_session)):
-    # Calcolo on-demand dai match esistenti:
-    # - cappotto 6-0: vincenti +4, perdenti -1
-    # - vittoria normale: vincenti +3, perdenti +1
-    # - pareggi: 0 (se vuoi +1 a tutti, vedi commento sotto)
-    sql = text("""
-        SELECT
-          p.id,
-          p.name,
-          p.photo_url,
-          COALESCE(SUM(
-            CASE
-              -- cappotto 6-0 vinto da Team A
-              WHEN m.score_a = 6 AND m.score_b = 0 AND p.id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id) THEN 4
-              WHEN m.score_a = 6 AND m.score_b = 0 AND p.id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id) THEN -1
-
-              -- cappotto 0-6 vinto da Team B
-              WHEN m.score_b = 6 AND m.score_a = 0 AND p.id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id) THEN 4
-              WHEN m.score_b = 6 AND m.score_a = 0 AND p.id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id) THEN -1
-
-              -- vittorie normali
-              WHEN m.score_a > m.score_b AND p.id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id) THEN 3
-              WHEN m.score_b > m.score_a AND p.id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id) THEN 3
-
-              -- sconfitte normali
-              WHEN m.score_a < m.score_b AND p.id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id) THEN 1
-              WHEN m.score_b < m.score_a AND p.id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id) THEN 1
-
-              -- pareggi: 0 (per dare +1 a tutti nei pareggi, sostituisci 0 con 1
-              -- e aggiungi la condizione: AND m.score_a = m.score_b)
-              ELSE 0
-            END
-          ), 0) AS points
+    ensure_scores_table(session)
+    rows = session.exec(text("""
+        SELECT p.id, p.name, p.photo_url, COALESCE(ps.points, 0) AS points
         FROM players p
-        LEFT JOIN matches m
-          ON p.id IN (
-            m.teamA_attacker_id, m.teamA_goalkeeper_id,
-            m.teamB_attacker_id, m.teamB_goalkeeper_id
-          )
-        GROUP BY p.id, p.name, p.photo_url
+        LEFT JOIN players_scores ps ON ps.player_id = p.id
         ORDER BY points DESC, p.name ASC
-    """)
-    rows = session.exec(sql).all()
-    return [
-        {"id": r[0], "name": r[1], "photo_url": r[2], "points": int(r[3])}
-        for r in rows
-    ]
+    """)).all()
+    return [{"id": r[0], "name": r[1], "photo_url": r[2], "points": int(r[3])} for r in rows]
+
+@app.post("/admin/recompute-leaderboard")
+def recompute_leaderboard(session: Session = Depends(get_session)):
+    try:
+        recompute_scores_tx(session)
+        session.commit()
+        return {"status": "ok"}
+    except Exception as e:
+        session.rollback()
+        print("ERROR recompute:", repr(e))
+        raise HTTPException(status_code=500, detail="Recompute failed")
 
 # ========== MATCHES ==========
 
@@ -211,7 +282,7 @@ def create_match(data: MatchIn, session: Session = Depends(get_session)):
         for p in lose_team:
             awarded[p.id] = 1
 
-    # Manteniamo l'aggiornamento dei punti materializzati (non usato da /leaderboard on-demand)
+    # (facoltativo) mantieni anche Player.points se vuoi, ma la classifica non lo usa:
     for pid, pts in awarded.items():
         players[pid].points += pts
     session.add_all(players.values())
@@ -230,6 +301,15 @@ def create_match(data: MatchIn, session: Session = Depends(get_session)):
     session.add(m)
     session.commit()
     session.refresh(m)
+
+    # ricalcola classifica materializzata
+    try:
+        recompute_scores_tx(session)
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        print("ERROR recompute after create_match:", repr(e))
+
     return m
 
 @app.delete("/matches/{match_id}")
@@ -239,7 +319,15 @@ def delete_match(match_id: int, session: Session = Depends(get_session)):
         raise HTTPException(status_code=404, detail="Match not found")
     session.delete(m)
     session.commit()
-    # Nessun ricalcolo necessario: /leaderboard calcola dallo storico
+
+    # ricalcola classifica materializzata
+    try:
+        recompute_scores_tx(session)
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        print("ERROR recompute after delete_match:", repr(e))
+
     return {"status": "ok"}
 
 # ========== ADMIN ==========
@@ -251,8 +339,9 @@ def admin_reset(session: Session = Depends(get_session)):
         session.delete(m)
     session.commit()
 
-    # opzionale: azzera i punti materializzati (non necessari per /leaderboard)
-    session.exec(text("UPDATE players SET points = 0"))
+    # opzionale: azzera i punti materializzati e riallinea tabella punteggi
+    ensure_scores_table(session)
+    session.exec(text("UPDATE players_scores SET points = 0, updated_at = NOW()"))
     session.commit()
 
     return {"players": session.exec(select(func.count(Player.id))).one(), "matches": 0}
