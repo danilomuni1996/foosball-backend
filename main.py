@@ -5,7 +5,7 @@ from sqlmodel import Session, select, SQLModel
 from typing import Optional, List, Dict
 from pathlib import Path
 from models import Player, Match
-from db import init_db, engine
+from db import init_db, engine  # vedi db.py aggiornato con pool_pre_ping e sslmode=require
 import json
 from sqlalchemy import func, text
 from datetime import datetime
@@ -27,7 +27,8 @@ app.mount("/static", StaticFiles(directory=str(UPLOAD_DIR)), name="static")
 
 @app.on_event("startup")
 def on_startup():
-    init_db()
+    # Evita accesso DB in avvio (Neon può essere idle/saturo). Se serve, chiama init_db(lazy=False) da endpoint admin.
+    pass
 
 def get_session():
     with Session(engine) as session:
@@ -37,10 +38,18 @@ def get_session():
 def root():
     return {"ok": True}
 
+# Healthcheck che non fa fallire il pod
+@app.get("/healthz")
+def healthz(session: Session = Depends(get_session)):
+    try:
+        session.exec(text("SELECT 1"))
+        return {"ok": True, "db": "up"}
+    except Exception:
+        return {"ok": True, "db": "down"}
+
 # --------- helper: tabella punteggi materializzata ---------
 
 def ensure_scores_table(session: Session):
-    # Crea tabella players_scores se non esiste e inserisce le righe per i giocatori mancanti
     session.exec(text("""
         CREATE TABLE IF NOT EXISTS players_scores (
             player_id INTEGER PRIMARY KEY REFERENCES players(id) ON DELETE CASCADE,
@@ -57,7 +66,6 @@ def ensure_scores_table(session: Session):
     session.commit()
 
 def recompute_scores_tx(session: Session):
-    # Ricostruisce i punteggi da zero in una transazione aperta
     ensure_scores_table(session)
 
     # azzera
@@ -147,7 +155,7 @@ async def create_player(
     session.commit()
     session.refresh(p)
 
-    # assicurati che esista una riga in players_scores
+    # assicura record in players_scores
     ensure_scores_table(session)
     session.exec(text("""
         INSERT INTO players_scores (player_id, points, updated_at)
@@ -282,7 +290,7 @@ def create_match(data: MatchIn, session: Session = Depends(get_session)):
         for p in lose_team:
             awarded[p.id] = 1
 
-    # (facoltativo) mantieni anche Player.points se vuoi, ma la classifica non lo usa:
+    # opzionale: mantieni anche Player.points, ma la classifica non lo usa
     for pid, pts in awarded.items():
         players[pid].points += pts
     session.add_all(players.values())
@@ -339,7 +347,7 @@ def admin_reset(session: Session = Depends(get_session)):
         session.delete(m)
     session.commit()
 
-    # opzionale: azzera i punti materializzati e riallinea tabella punteggi
+    # azzera i punti materializzati e riallinea tabella punteggi
     ensure_scores_table(session)
     session.exec(text("UPDATE players_scores SET points = 0, updated_at = NOW()"))
     session.commit()
