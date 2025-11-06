@@ -110,6 +110,8 @@ def delete_player_by_name(
 
 # ========== LEADERBOARD (ON-DEMAND) ==========
 
+from sqlalchemy import text
+
 @app.get("/leaderboard")
 def leaderboard(session: Session = Depends(get_session)):
     # Calcolo on-demand dai match esistenti:
