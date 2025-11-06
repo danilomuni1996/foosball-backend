@@ -5,7 +5,7 @@ from sqlmodel import Session, select, SQLModel
 from typing import Optional, List, Dict
 from pathlib import Path
 from models import Player, Match
-from db import init_db, engine  # engine resiliente (pool_pre_ping, sslmode=require)
+from db import init_db, engine  # db.py configurato con pool_pre_ping e sslmode=require
 import json
 from sqlalchemy import func, text
 from datetime import datetime
@@ -27,7 +27,7 @@ app.mount("/static", StaticFiles(directory=str(UPLOAD_DIR)), name="static")
 
 @app.on_event("startup")
 def on_startup():
-    # Evita accesso DB in avvio (Neon può essere idle/saturo)
+    # Evita accesso DB in avvio (Neon può essere idle/saturo). Se serve, chiama init_db(lazy=False) da endpoint admin.
     pass
 
 def get_session():
@@ -38,7 +38,7 @@ def get_session():
 def root():
     return {"ok": True}
 
-# Healthcheck
+# Healthcheck che non fa fallire il pod
 @app.get("/healthz")
 def healthz(session: Session = Depends(get_session)):
     try:
@@ -47,58 +47,85 @@ def healthz(session: Session = Depends(get_session)):
     except Exception:
         return {"ok": True, "db": "down"}
 
-# ====== ADMIN: init schema (crea tabelle) ======
+# ========== UTILS RICALCOLO PUNTI SU PLAYERS ==========
 
-@app.post("/admin/init-db")
-def admin_init_db():
-    try:
-        SQLModel.metadata.create_all(engine)
-        return {"status": "ok", "message": "Schema created/verified"}
-    except Exception as e:
-        print("ERROR /admin/init-db:", repr(e))
-        raise HTTPException(status_code=500, detail="Init DB failed")
+def recompute_players_points_tx(session: Session):
+    """
+    Ricostruisce Player.points in base alle partite presenti in matches,
+    applicando la regola:
+      - cappotto 6-0: vincenti +4, perdenti -1
+      - vittoria normale: vincenti +3
+      - sconfitta normale: +1 ai perdenti
+    """
+    # Assicurati che la colonna points esista (eseguire una tantum se manca):
+    # ALTER TABLE players ADD COLUMN points INTEGER NOT NULL DEFAULT 0;
 
-# ========== HELPERS punteggio ON-DEMAND ==========
+    # 1) azzera
+    session.exec(text("UPDATE players SET points = 0"))
 
-ON_DEMAND_SQL = text("""
-    SELECT
-      p.id,
-      p.name,
-      p.photo_url,
-      COALESCE(SUM(
-        CASE
-          -- cappotto 6-0 vinto da Team A: +4 ai due di A, -1 ai due di B
-          WHEN m.score_a = 6 AND m.score_b = 0 AND p.id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id) THEN 4
-          WHEN m.score_a = 6 AND m.score_b = 0 AND p.id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id) THEN -1
+    # 2) cappotto 6-0 vinto da Team A: +4 ai due di A, -1 ai due di B
+    session.exec(text("""
+        UPDATE players p
+        SET points = p.points + 4
+        FROM matches m
+        WHERE m.score_a = 6 AND m.score_b = 0
+          AND p.id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id)
+    """))
+    session.exec(text("""
+        UPDATE players p
+        SET points = p.points - 1
+        FROM matches m
+        WHERE m.score_a = 6 AND m.score_b = 0
+          AND p.id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id)
+    """))
 
-          -- cappotto 0-6 vinto da Team B: +4 ai due di B, -1 ai due di A
-          WHEN m.score_b = 6 AND m.score_a = 0 AND p.id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id) THEN 4
-          WHEN m.score_b = 6 AND m.score_a = 0 AND p.id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id) THEN -1
+    # 3) cappotto 0-6 vinto da Team B: +4 ai due di B, -1 ai due di A
+    session.exec(text("""
+        UPDATE players p
+        SET points = p.points + 4
+        FROM matches m
+        WHERE m.score_b = 6 AND m.score_a = 0
+          AND p.id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id)
+    """))
+    session.exec(text("""
+        UPDATE players p
+        SET points = p.points - 1
+        FROM matches m
+        WHERE m.score_b = 6 AND m.score_a = 0
+          AND p.id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id)
+    """))
 
-          -- vittoria normale: +3 ai vincenti
-          WHEN m.score_a > m.score_b AND p.id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id) THEN 3
-          WHEN m.score_b > m.score_a AND p.id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id) THEN 3
+    # 4) vittorie normali: +3 ai vincenti
+    session.exec(text("""
+        UPDATE players p
+        SET points = p.points + 3
+        FROM matches m
+        WHERE m.score_a > m.score_b
+          AND p.id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id)
+    """))
+    session.exec(text("""
+        UPDATE players p
+        SET points = p.points + 3
+        FROM matches m
+        WHERE m.score_b > m.score_a
+          AND p.id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id)
+    """))
 
-          -- sconfitta normale: +1 ai perdenti
-          WHEN m.score_a < m.score_b AND p.id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id) THEN 1
-          WHEN m.score_b < m.score_a AND p.id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id) THEN 1
-
-          -- pareggi: 0 (se vuoi +1 a tutti, aggiungi WHEN m.score_a = m.score_b ...)
-          ELSE 0
-        END
-      ), 0) AS points
-    FROM players p
-    LEFT JOIN matches m
-      ON p.id IN (
-        m.teamA_attacker_id, m.teamA_goalkeeper_id,
-        m.teamB_attacker_id, m.teamB_goalkeeper_id
-      )
-    GROUP BY p.id, p.name, p.photo_url
-""")
-
-def fetch_players_with_points(session: Session):
-    rows = session.exec(ON_DEMAND_SQL).all()
-    return [{"id": r[0], "name": r[1], "photo_url": r[2], "points": int(r[3])} for r in rows]
+    # 5) sconfitte normali: +1 ai perdenti
+    session.exec(text("""
+        UPDATE players p
+        SET points = p.points + 1
+        FROM matches m
+        WHERE m.score_a < m.score_b
+          AND p.id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id)
+    """))
+    session.exec(text("""
+        UPDATE players p
+        SET points = p.points + 1
+        FROM matches m
+        WHERE m.score_b < m.score_a
+          AND p.id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id)
+    """))
 
 # ========== PLAYERS ==========
 
@@ -121,16 +148,9 @@ async def create_player(
     session.refresh(p)
     return p
 
-# Restituisce i player con points calcolati ON-DEMAND
-@app.get("/players")
-def list_players_with_points(session: Session = Depends(get_session)):
-    try:
-        data = fetch_players_with_points(session)
-        data.sort(key=lambda x: (x["name"] or "").lower())
-        return data
-    except Exception as e:
-        print("ERROR /players (on-demand):", repr(e))
-        raise HTTPException(status_code=500, detail="Players query failed")
+@app.get("/players", response_model=List[Player])
+def list_players(session: Session = Depends(get_session)):
+    return session.exec(select(Player)).all()
 
 @app.delete("/players/{player_id}")
 def delete_player_by_id(player_id: int, session: Session = Depends(get_session)):
@@ -180,15 +200,10 @@ def delete_player_by_name(
 
 # ========== LEADERBOARD ==========
 
-@app.get("/leaderboard")
+@app.get("/leaderboard", response_model=List[Player])
 def leaderboard(session: Session = Depends(get_session)):
-    try:
-        data = fetch_players_with_points(session)
-        data.sort(key=lambda x: (-x["points"], (x["name"] or "").lower()))
-        return data
-    except Exception as e:
-        print("ERROR /leaderboard (on-demand):", repr(e))
-        raise HTTPException(status_code=500, detail="Leaderboard query failed")
+    # legge direttamente da players ordinando per points
+    return session.exec(select(Player).order_by(Player.points.desc(), Player.name.asc())).all()
 
 # ========== MATCHES ==========
 
@@ -240,6 +255,11 @@ def create_match(data: MatchIn, session: Session = Depends(get_session)):
         for p in lose_team:
             awarded[p.id] = 1
 
+    # opzionale: puoi rimuovere gli incrementi immediati se preferisci solo il ricalcolo globale
+    for pid, pts in awarded.items():
+        players[pid].points += pts
+    session.add_all(players.values())
+
     m = Match(
         teamA_attacker_id=data.teamA_attacker_id,
         teamA_goalkeeper_id=data.teamA_goalkeeper_id,
@@ -254,6 +274,15 @@ def create_match(data: MatchIn, session: Session = Depends(get_session)):
     session.add(m)
     session.commit()
     session.refresh(m)
+
+    # ricalcolo completo opzionale anche qui (puoi commentare se tieni gli incrementi immediati)
+    # try:
+    #     recompute_players_points_tx(session)
+    #     session.commit()
+    # except Exception as e:
+    #     session.rollback()
+    #     print("ERROR recompute after create_match:", repr(e))
+
     return m
 
 @app.delete("/matches/{match_id}")
@@ -263,7 +292,15 @@ def delete_match(match_id: int, session: Session = Depends(get_session)):
         raise HTTPException(status_code=404, detail="Match not found")
     session.delete(m)
     session.commit()
-    # Nessun ricalcolo necessario: /players e /leaderboard calcolano on-demand
+
+    # DOPO cancellazione ricalcola sempre per rimuovere l’effetto del match eliminato
+    try:
+        recompute_players_points_tx(session)
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        print("ERROR recompute after delete_match:", repr(e))
+
     return {"status": "ok"}
 
 # ========== ADMIN ==========
@@ -274,5 +311,21 @@ def admin_reset(session: Session = Depends(get_session)):
     for m in session.exec(select(Match)).all():
         session.delete(m)
     session.commit()
-    # nessun reset punti necessario: calcolo on-demand
+
+    # azzera i punti dei giocatori (nessuna partita rimasta)
+    session.exec(text("UPDATE players SET points = 0"))
+    session.commit()
+
     return {"players": session.exec(select(func.count(Player.id))).one(), "matches": 0}
+
+# Endpoint per ricalcolo manuale completo (utile dopo import massivi)
+@app.post("/admin/recompute-leaderboard")
+def recompute_leaderboard(session: Session = Depends(get_session)):
+    try:
+        recompute_players_points_tx(session)
+        session.commit()
+        return {"status": "ok"}
+    except Exception as e:
+        session.rollback()
+        print("ERROR recompute (manual):", repr(e))
+        raise HTTPException(status_code=500, detail="Recompute failed")
