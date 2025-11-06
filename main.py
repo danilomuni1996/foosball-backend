@@ -5,7 +5,7 @@ from sqlmodel import Session, select, SQLModel
 from typing import Optional, List, Dict
 from pathlib import Path
 from models import Player, Match
-from db import init_db, engine  # engine resiliente (pool_pre_ping, sslmode=require) e init lazy
+from db import init_db, engine  # engine resiliente (pool_pre_ping, sslmode=require)
 import json
 from sqlalchemy import func, text
 from datetime import datetime
@@ -46,6 +46,17 @@ def healthz(session: Session = Depends(get_session)):
         return {"ok": True, "db": "up"}
     except Exception:
         return {"ok": True, "db": "down"}
+
+# ====== ADMIN: init schema (crea tabelle) ======
+
+@app.post("/admin/init-db")
+def admin_init_db():
+    try:
+        SQLModel.metadata.create_all(engine)
+        return {"status": "ok", "message": "Schema created/verified"}
+    except Exception as e:
+        print("ERROR /admin/init-db:", repr(e))
+        raise HTTPException(status_code=500, detail="Init DB failed")
 
 # ========== HELPERS punteggio ON-DEMAND ==========
 
@@ -110,26 +121,69 @@ async def create_player(
     session.refresh(p)
     return p
 
-# Restituisce i player con points calcolati ON-DEMAND (non il campo persistito)
+# Restituisce i player con points calcolati ON-DEMAND
 @app.get("/players")
 def list_players_with_points(session: Session = Depends(get_session)):
     try:
         data = fetch_players_with_points(session)
-        # Ordina per nome o per points a tua scelta; qui per nome
         data.sort(key=lambda x: (x["name"] or "").lower())
         return data
     except Exception as e:
         print("ERROR /players (on-demand):", repr(e))
         raise HTTPException(status_code=500, detail="Players query failed")
 
+@app.delete("/players/{player_id}")
+def delete_player_by_id(player_id: int, session: Session = Depends(get_session)):
+    p = session.get(Player, player_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Player not found")
+    if getattr(p, "photo_url", None):
+        filename = p.photo_url.replace("/static/", "")
+        path = UPLOAD_DIR / filename
+        if path.exists():
+            try:
+                path.unlink()
+            except Exception:
+                pass
+    session.delete(p)
+    session.commit()
+    return {"status": "ok", "deleted": {"id": p.id, "name": p.name}}
+
+@app.delete("/players/by-name")
+def delete_player_by_name(
+    name: str,
+    like: bool = False,
+    session: Session = Depends(get_session)
+):
+    cond = func.lower(Player.name) == name.lower() if not like \
+        else func.lower(Player.name).like(f"%{name.lower()}%")
+    players = session.exec(select(Player).where(cond)).all()
+    if not players:
+        raise HTTPException(status_code=404, detail="Player not found")
+    if len(players) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail={"multiple": [{"id": p.id, "name": p.name} for p in players]}
+        )
+    p = players[0]
+    if getattr(p, "photo_url", None):
+        filename = p.photo_url.replace("/static/", "")
+        path = UPLOAD_DIR / filename
+        if path.exists():
+            try:
+                path.unlink()
+            except Exception:
+                pass
+    session.delete(p)
+    session.commit()
+    return {"status": "ok", "deleted": {"id": p.id, "name": p.name}}
+
 # ========== LEADERBOARD ==========
 
-# Classifica on-demand: calcolo diretto dai match
 @app.get("/leaderboard")
 def leaderboard(session: Session = Depends(get_session)):
     try:
         data = fetch_players_with_points(session)
-        # Ordina per points DESC e poi per nome
         data.sort(key=lambda x: (-x["points"], (x["name"] or "").lower()))
         return data
     except Exception as e:
@@ -186,7 +240,6 @@ def create_match(data: MatchIn, session: Session = Depends(get_session)):
         for p in lose_team:
             awarded[p.id] = 1
 
-    # Non è necessario aggiornare Player.points, perché la classifica è on-demand
     m = Match(
         teamA_attacker_id=data.teamA_attacker_id,
         teamA_goalkeeper_id=data.teamA_goalkeeper_id,
@@ -210,7 +263,7 @@ def delete_match(match_id: int, session: Session = Depends(get_session)):
         raise HTTPException(status_code=404, detail="Match not found")
     session.delete(m)
     session.commit()
-    # Nessun ricalcolo necessario: la classifica/players è on-demand
+    # Nessun ricalcolo necessario: /players e /leaderboard calcolano on-demand
     return {"status": "ok"}
 
 # ========== ADMIN ==========
