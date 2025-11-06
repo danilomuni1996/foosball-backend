@@ -220,14 +220,18 @@ def delete_player_by_name(
 
 @app.get("/leaderboard")
 def leaderboard(session: Session = Depends(get_session)):
-    ensure_scores_table(session)
-    rows = session.exec(text("""
-        SELECT p.id, p.name, p.photo_url, COALESCE(ps.points, 0) AS points
-        FROM players p
-        LEFT JOIN players_scores ps ON ps.player_id = p.id
-        ORDER BY points DESC, p.name ASC
-    """)).all()
-    return [{"id": r[0], "name": r[1], "photo_url": r[2], "points": int(r[3])} for r in rows]
+    try:
+        ensure_scores_table(session)
+        rows = session.exec(text("""
+            SELECT p.id, p.name, p.photo_url, COALESCE(ps.points, 0) AS points
+            FROM players p
+            LEFT JOIN players_scores ps ON ps.player_id = p.id
+            ORDER BY points DESC, p.name ASC
+        """)).all()
+        return [{"id": r[0], "name": r[1], "photo_url": r[2], "points": int(r[3])} for r in rows]
+    except Exception as e:
+        print("ERROR /leaderboard:", repr(e))
+        raise HTTPException(status_code=500, detail="Leaderboard query failed")
 
 @app.post("/admin/recompute-leaderboard")
 def recompute_leaderboard(session: Session = Depends(get_session)):
