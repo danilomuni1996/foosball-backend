@@ -4,3 +4,4 @@ sqlmodel
 sqlalchemy
 python-multipart
 pillow
+psycopg2-binary
