@@ -1,84 +1,17 @@
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from sqlmodel import SQLModel, Field, create_engine, Session, select
-from typing import List, Optional
-import os
-from contextlib import contextmanager
-import datetime
-import shutil
+from fastapi.staticfiles import StaticFiles
+from sqlmodel import Session, select, SQLModel
+from typing import Optional, List, Dict
+from pathlib import Path
+from models import Player, Match
+from db import engine
+import json
+from sqlalchemy import func, text
+from datetime import datetime
 
-# --- Configurazione Generale ---
-DATABASE_FILE = "foosball.db"
-DATABASE_URL = f"sqlite:///{DATABASE_FILE}"
-UPLOADS_DIR = "uploads"
+app = FastAPI(title="Foosball API")
 
-# --- Modelli Dati ---
-class PlayerBase(SQLModel):
-    name: str
-    preferred_role: Optional[str] = None
-
-class Player(PlayerBase, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    photo_url: Optional[str] = None
-    
-    # Campi calcolati dinamicamente, non memorizzati nel DB
-    points: int = 0
-    wins: int = 0
-    losses: int = 0
-    draws: int = 0
-    matches_played: int = 0
-
-class PlayerCreate(PlayerBase):
-    pass
-
-class PlayerReadWithStats(PlayerBase):
-    id: int
-    photo_url: Optional[str]
-    points: int
-    wins: int
-    losses: int
-    draws: int
-    matches_played: int
-
-class Match(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    teamA_attacker_id: int
-    teamA_goalkeeper_id: int
-    teamB_attacker_id: int
-    teamB_goalkeeper_id: int
-    score_a: int
-    score_b: int
-    created_at: datetime.datetime = Field(default_factory=datetime.datetime.utcnow)
-
-class MatchCreate(SQLModel):
-    teamA_attacker_id: int
-    teamA_goalkeeper_id: int
-    teamB_attacker_id: int
-    teamB_goalkeeper_id: int
-    score_a: int
-    score_b: int
-
-# --- Gestione Database ---
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-
-def create_db_and_tables():
-    SQLModel.metadata.create_all(engine)
-    if not os.path.exists(UPLOADS_DIR):
-        os.makedirs(UPLOADS_DIR)
-
-@contextmanager
-def get_session():
-    session = Session(engine)
-    try:
-        yield session
-    finally:
-        session.close()
-
-# --- App FastAPI ---
-app = FastAPI()
-
-# CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -87,122 +20,194 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount static files directory
-app.mount("/uploads", StaticFiles(directory=UPLOADS_DIR), name="uploads")
-
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(UPLOAD_DIR)), name="static")
 
 @app.on_event("startup")
 def on_startup():
-    create_db_and_tables()
+    pass
 
-# --- Funzioni di Logica ---
-def get_player_stats(session: Session) -> List[PlayerReadWithStats]:
-    """Calcola le statistiche per ogni giocatore basandosi sulle partite."""
-    players = session.exec(select(Player)).all()
-    matches = session.exec(select(Match)).all()
+def get_session():
+    with Session(engine) as session:
+        yield session
+
+@app.get("/")
+def root():
+    return {"ok": True}
+
+@app.get("/healthz")
+def healthz(session: Session = Depends(get_session)):
+    try:
+        session.exec(text("SELECT 1"))
+        return {"ok": True, "db": "up"}
+    except Exception:
+        return {"ok": True, "db": "down"}
+
+# ========== UTILS RICALCOLO PUNTI (VERSIONE FINALE) ==========
+def recompute_players_points_tx(session: Session):
+    """
+    Ricostruisce i punti con una singola query SQL efficiente,
+    usando i nomi di colonna corretti (con maiuscole e virgolette).
+    """
+    recompute_query = text('''
+        WITH player_points AS (
+            SELECT
+                player_id,
+                CASE
+                    WHEN (team = 'A' AND score_a = 6 AND score_b = 0) OR (team = 'B' AND score_b = 6 AND score_a = 0) THEN 4
+                    WHEN (team = 'A' AND score_a > score_b) OR (team = 'B' AND score_b > score_a) THEN 3
+                    WHEN (team = 'A' AND score_b = 6 AND score_a = 0) OR (team = 'B' AND score_a = 6 AND score_b = 0) THEN -1
+                    ELSE 1
+                END AS points
+            FROM (
+                SELECT id, "teamA_attacker_id" AS player_id, 'A' AS team, score_a, score_b FROM match UNION ALL
+                SELECT id, "teamA_goalkeeper_id" AS player_id, 'A' AS team, score_a, score_b FROM match UNION ALL
+                SELECT id, "teamB_attacker_id" AS player_id, 'B' AS team, score_a, score_b FROM match UNION ALL
+                SELECT id, "teamB_goalkeeper_id" AS player_id, 'B' AS team, score_a, score_b FROM match
+            ) AS unnested_matches
+        ),
+        total_points AS (
+            SELECT player_id, SUM(points) AS total
+            FROM player_points
+            GROUP BY player_id
+        )
+        UPDATE player p
+        SET points = COALESCE(tp.total, 0)
+        FROM total_points tp
+        WHERE p.id = tp.player_id;
+    ''')
     
-    player_stats = {p.id: p for p in players}
+    session.exec(text("UPDATE player SET points = 0"))
+    session.exec(recompute_query)
 
-    for p in player_stats.values():
-        p.points = 0
-        p.wins = 0
-        p.losses = 0
-        p.draws = 0
-        p.matches_played = 0
-
-    for match in matches:
-        team_a_ids = [match.teamA_attacker_id, match.teamA_goalkeeper_id]
-        team_b_ids = [match.teamB_attacker_id, match.teamB_goalkeeper_id]
-        
-        all_match_players = team_a_ids + team_b_ids
-        for player_id in all_match_players:
-            if player_id in player_stats:
-                player_stats[player_id].matches_played += 1
-
-        if match.score_a > match.score_b:
-            for player_id in team_a_ids:
-                if player_id in player_stats:
-                    player_stats[player_id].points += 3
-                    player_stats[player_id].wins += 1
-            for player_id in team_b_ids:
-                if player_id in player_stats:
-                    player_stats[player_id].losses += 1
-        elif match.score_b > match.score_a:
-            for player_id in team_b_ids:
-                if player_id in player_stats:
-                    player_stats[player_id].points += 3
-                    player_stats[player_id].wins += 1
-            for player_id in team_a_ids:
-                if player_id in player_stats:
-                    player_stats[player_id].losses += 1
-        else:
-            for player_id in all_match_players:
-                 if player_id in player_stats:
-                    player_stats[player_id].points += 1
-                    player_stats[player_id].draws += 1
-
-    return list(player_stats.values())
-
-
-# --- Endpoints ---
-@app.get("/leaderboard", response_model=List[PlayerReadWithStats])
-def get_leaderboard(session: Session = Depends(get_session)):
-    """Ritorna la classifica dei giocatori con statistiche complete."""
-    player_stats = get_player_stats(session)
-    # Ordina i giocatori per punti in ordine decrescente
-    sorted_players = sorted(player_stats, key=lambda p: p.points, reverse=True)
-    return sorted_players
-
-@app.get("/players", response_model=List[PlayerReadWithStats])
-def read_players(session: Session = Depends(get_session)):
-    """Ritorna tutti i giocatori con le loro statistiche aggiornate."""
-    player_stats = get_player_stats(session)
-    return sorted(player_stats, key=lambda p: p.name)
-
-@app.post("/players", response_model=PlayerReadWithStats, status_code=201)
-def create_player(name: str, preferred_role: Optional[str] = None, photo: UploadFile = File(None), session: Session = Depends(get_session)):
+# ========== PLAYERS ==========
+@app.post("/players", response_model=Player)
+async def create_player(
+    name: str = Form(...),
+    preferred_role: Optional[str] = Form(None),
+    photo: Optional[UploadFile] = File(None),
+    session: Session = Depends(get_session),
+):
     photo_url = None
     if photo:
-        file_path = os.path.join(UPLOADS_DIR, photo.filename)
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(photo.file, buffer)
-        photo_url = f"/uploads/{photo.filename}"
-
-    player = Player(name=name, preferred_role=preferred_role, photo_url=photo_url)
-    session.add(player)
+        dest = UPLOAD_DIR / photo.filename
+        with dest.open("wb") as f:
+            f.write(await photo.read())
+        photo_url = f"/static/{photo.filename}"
+    p = Player(name=name, preferred_role=preferred_role, photo_url=photo_url)
+    session.add(p)
     session.commit()
-    session.refresh(player)
-    # Ritorna il giocatore con le statistiche iniziali
-    return PlayerReadWithStats(**player.model_dump(), points=0, wins=0, losses=0, draws=0, matches_played=0)
+    session.refresh(p)
+    return p
 
+@app.get("/players", response_model=List[Player])
+def list_players(session: Session = Depends(get_session)):
+    return session.exec(select(Player)).all()
 
-@app.delete("/players/{player_id}", status_code=204)
-def delete_player(player_id: int, session: Session = Depends(get_session)):
-    player = session.get(Player, player_id)
-    if not player:
+@app.delete("/players/{player_id}")
+def delete_player_by_id(player_id: int, session: Session = Depends(get_session)):
+    p = session.get(Player, player_id)
+    if not p:
         raise HTTPException(status_code=404, detail="Player not found")
-    session.delete(player)
+    if getattr(p, "photo_url", None):
+        filename = p.photo_url.replace("/static/", "")
+        path = UPLOAD_DIR / filename
+        if path.exists():
+            try:
+                path.unlink()
+            except Exception:
+                pass
+    session.delete(p)
     session.commit()
-    return
+    return {"status": "ok", "deleted": {"id": p.id, "name": p.name}}
+
+# ========== LEADERBOARD ==========
+@app.get("/leaderboard", response_model=List[Player])
+def leaderboard(session: Session = Depends(get_session)):
+    try:
+        recompute_players_points_tx(session)
+        session.commit()
+        return session.exec(select(Player).order_by(Player.points.desc(), Player.name.asc())).all()
+    except Exception as e:
+        session.rollback()
+        print(f"FATAL ERROR on /leaderboard: {repr(e)}")
+        raise HTTPException(status_code=500, detail="Failed to recompute leaderboard.")
+
+# ========== MATCHES ==========
+class MatchIn(SQLModel):
+    teamA_attacker_id: int
+    teamA_goalkeeper_id: int
+    teamB_attacker_id: int
+    teamB_goalkeeper_id: int
+    score_a: int
+    score_b: int
 
 @app.get("/matches", response_model=List[Match])
-def read_matches(session: Session = Depends(get.session)):
-    matches = session.exec(select(Match)).all()
-    return matches
+def list_matches(session: Session = Depends(get_session)):
+    return session.exec(select(Match).order_by(Match.created_at.desc())).all()
 
-@app.post("/matches", response_model=Match, status_code=201)
-def create_match(match: MatchCreate, session: Session = Depends(get_session)):
-    db_match = Match.model_validate(match)
-    session.add(db_match)
+@app.post("/matches", response_model=Match)
+def create_match(data: MatchIn, session: Session = Depends(get_session)):
+    ids = [
+        data.teamA_attacker_id, data.teamA_goalkeeper_id,
+        data.teamB_attacker_id, data.teamB_goalkeeper_id,
+    ]
+    players_check = session.exec(select(Player).where(Player.id.in_(ids))).all()
+    if len(players_check) != 4:
+        raise HTTPException(status_code=400, detail="Giocatori non validi")
+
+    winner = "A" if data.score_a > data.score_b else "B"
+    cappotto = (data.score_a == 6 and data.score_b == 0) or (data.score_a == 0 and data.score_b == 6)
+    awarded = {}
+    
+    if winner == "A":
+        awarded.update({str(p_id): (4 if cappotto else 3) for p_id in [data.teamA_attacker_id, data.teamA_goalkeeper_id]})
+        awarded.update({str(p_id): (-1 if cappotto else 1) for p_id in [data.teamB_attacker_id, data.teamB_goalkeeper_id]})
+    else:
+        awarded.update({str(p_id): (4 if cappotto else 3) for p_id in [data.teamB_attacker_id, data.teamB_goalkeeper_id]})
+        awarded.update({str(p_id): (-1 if cappotto else 1) for p_id in [data.teamA_attacker_id, data.teamA_goalkeeper_id]})
+
+    m = Match(
+        teamA_attacker_id=data.teamA_attacker_id,
+        teamA_goalkeeper_id=data.teamA_goalkeeper_id,
+        teamB_attacker_id=data.teamB_attacker_id,
+        teamB_goalkeeper_id=data.teamB_goalkeeper_id,
+        score_a=data.score_a,
+        score_b=data.score_b,
+        winner_team=winner,
+        points_awarded=json.dumps(awarded),
+        created_at=datetime.utcnow(),
+    )
+    session.add(m)
     session.commit()
-    session.refresh(db_match)
-    return db_match
+    session.refresh(m)
+    return m
 
-@app.delete("/matches/{match_id}", status_code=204)
+@app.delete("/matches/{match_id}")
 def delete_match(match_id: int, session: Session = Depends(get_session)):
-    match = session.get(Match, match_id)
-    if not match:
+    m = session.get(Match, match_id)
+    if not m:
         raise HTTPException(status_code=404, detail="Match not found")
-    session.delete(match)
+    session.delete(m)
     session.commit()
-    return
+    return {"status": "ok"}
+
+# ========== ADMIN ==========
+@app.post("/admin/reset")
+def admin_reset(session: Session = Depends(get_session)):
+    session.exec(text("DELETE FROM match"))
+    session.exec(text("UPDATE player SET points = 0"))
+    session.commit()
+    return {"players": session.exec(select(func.count(Player.id))).one(), "matches": 0}
+
+@app.post("/admin/recompute-leaderboard")
+def recompute_leaderboard(session: Session = Depends(get_session)):
+    try:
+        recompute_players_points_tx(session)
+        session.commit()
+        return {"status": "ok"}
+    except Exception as e:
+        session.rollback()
+        print(f"ERROR recompute (manual): {repr(e)}")
+        raise HTTPException(status_code=500, detail="Recompute failed")
