@@ -17,11 +17,10 @@ class Match(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     created_at: datetime = Field(default_factory=datetime.utcnow)
-    # --- COLONNE CORRETTE (tutto minuscolo) ---
-    teama_attacker_id: int
-    teama_goalkeeper_id: int
-    teamb_attacker_id: int
-    teamb_goalkeeper_id: int
+    teamA_attacker_id: int
+    teamA_goalkeeper_id: int
+    teamB_attacker_id: int
+    teamB_goalkeeper_id: int
     score_a: int
     score_b: int
     winner_team: str
