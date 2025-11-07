@@ -5,14 +5,13 @@ from sqlmodel import Session, select, SQLModel
 from typing import Optional, List, Dict
 from pathlib import Path
 from models import Player, Match
-from db import init_db, engine
+from db import engine
 import json
 from sqlalchemy import func, text
 from datetime import datetime
 
 app = FastAPI(title="Foosball API")
 
-# CORS (sviluppo)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,57 +46,80 @@ def healthz(session: Session = Depends(get_session)):
 
 # ========== UTILS RICALCOLO PUNTI SU PLAYERS ==========
 
+# QUESTA È LA TUA FUNZIONE ORIGINALE, CORRETTA PER POSTGRESQL
 def recompute_players_points_tx(session: Session):
     """
-    Ricostruisce Player.points in base alle partite presenti in matches.
-    Questa versione usa SQL compatibile sia con PostgreSQL che con SQLite.
+    Ricostruisce Player.points in base alle partite presenti in matches,
+    usando sintassi PostgreSQL.
     """
-    # 1) azzera i punti di tutti i giocatori
+    # 1) azzera
     session.exec(text("UPDATE players SET points = 0"))
 
-    # 2) assegna i punti per le vittorie "cappotto" (6-0 o 0-6)
-    # +4 ai vincenti
+    # 2) cappotto 6-0 vinto da Team A: +4 ai due di A, -1 ai due di B
     session.exec(text("""
-        UPDATE players SET points = points + 4 WHERE id IN (
-            SELECT teamA_attacker_id FROM matches WHERE score_a = 6 AND score_b = 0 UNION ALL
-            SELECT teamA_goalkeeper_id FROM matches WHERE score_a = 6 AND score_b = 0 UNION ALL
-            SELECT teamB_attacker_id FROM matches WHERE score_b = 6 AND score_a = 0 UNION ALL
-            SELECT teamB_goalkeeper_id FROM matches WHERE score_b = 6 AND score_a = 0
-        )
+        UPDATE players p
+        SET points = p.points + 4
+        FROM matches m
+        WHERE m.score_a = 6 AND m.score_b = 0
+          AND p.id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id)
     """))
-    # -1 ai perdenti
     session.exec(text("""
-        UPDATE players SET points = points - 1 WHERE id IN (
-            SELECT teamB_attacker_id FROM matches WHERE score_a = 6 AND score_b = 0 UNION ALL
-            SELECT teamB_goalkeeper_id FROM matches WHERE score_a = 6 AND score_b = 0 UNION ALL
-            SELECT teamA_attacker_id FROM matches WHERE score_b = 6 AND score_a = 0 UNION ALL
-            SELECT teamA_goalkeeper_id FROM matches WHERE score_b = 6 AND score_a = 0
-        )
+        UPDATE players p
+        SET points = p.points - 1
+        FROM matches m
+        WHERE m.score_a = 6 AND m.score_b = 0
+          AND p.id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id)
     """))
 
-    # 3) assegna punti per vittorie normali (non cappotto)
-    # +3 ai vincenti
+    # 3) cappotto 0-6 vinto da Team B: +4 ai due di B, -1 ai due di A
     session.exec(text("""
-        UPDATE players SET points = points + 3 WHERE id IN (
-            SELECT teamA_attacker_id FROM matches WHERE score_a > score_b AND score_a != 6 UNION ALL
-            SELECT teamA_goalkeeper_id FROM matches WHERE score_a > score_b AND score_a != 6 UNION ALL
-            SELECT teamB_attacker_id FROM matches WHERE score_b > score_a AND score_b != 6 UNION ALL
-            SELECT teamB_goalkeeper_id FROM matches WHERE score_b > score_a AND score_b != 6
-        )
+        UPDATE players p
+        SET points = p.points + 4
+        FROM matches m
+        WHERE m.score_b = 6 AND m.score_a = 0
+          AND p.id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id)
+    """))
+    session.exec(text("""
+        UPDATE players p
+        SET points = p.points - 1
+        FROM matches m
+        WHERE m.score_b = 6 AND m.score_a = 0
+          AND p.id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id)
     """))
 
-    # 4) assegna punti per sconfitte normali (non cappotto)
-    # +1 ai perdenti
+    # 4) vittorie normali: +3 ai vincenti
     session.exec(text("""
-        UPDATE players SET points = points + 1 WHERE id IN (
-            SELECT teamB_attacker_id FROM matches WHERE score_a > score_b AND score_a != 6 UNION ALL
-            SELECT teamB_goalkeeper_id FROM matches WHERE score_a > score_b AND score_a != 6 UNION ALL
-            SELECT teamA_attacker_id FROM matches WHERE score_b > score_a AND score_b != 6 UNION ALL
-            SELECT teamA_goalkeeper_id FROM matches WHERE score_b > score_a AND score_b != 6
-        )
+        UPDATE players p
+        SET points = p.points + 3
+        FROM matches m
+        WHERE m.score_a > m.score_b
+          AND p.id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id)
+    """))
+    session.exec(text("""
+        UPDATE players p
+        SET points = p.points + 3
+        FROM matches m
+        WHERE m.score_b > m.score_a
+          AND p.id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id)
     """))
 
-# ========== PLAYERS ==========
+    # 5) sconfitte normali: +1 ai perdenti
+    session.exec(text("""
+        UPDATE players p
+        SET points = p.points + 1
+        FROM matches m
+        WHERE m.score_a < m.score_b
+          AND p.id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id)
+    """))
+    session.exec(text("""
+        UPDATE players p
+        SET points = p.points + 1
+        FROM matches m
+        WHERE m.score_b < m.score_a
+          AND p.id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id)
+    """))
+
+# ========== PLAYERS (invariato) ==========
 
 @app.post("/players", response_model=Player)
 async def create_player(
@@ -122,6 +144,7 @@ async def create_player(
 def list_players(session: Session = Depends(get_session)):
     return session.exec(select(Player)).all()
 
+# ... (le altre funzioni per i giocatori rimangono invariate) ...
 @app.delete("/players/{player_id}")
 def delete_player_by_id(player_id: int, session: Session = Depends(get_session)):
     p = session.get(Player, player_id)
@@ -168,23 +191,27 @@ def delete_player_by_name(
     session.commit()
     return {"status": "ok", "deleted": {"id": p.id, "name": p.name}}
 
-# ========== LEADERBOARD ==========
+# ========== LEADERBOARD (MODIFICATA) ==========
 
 @app.get("/leaderboard", response_model=List[Player])
 def leaderboard(session: Session = Depends(get_session)):
     try:
+        # 1. Ricalcola i punti usando la tua funzione originale per Postgres
         recompute_players_points_tx(session)
+        
+        # 2. Salva le modifiche
         session.commit()
+        
+        # 3. Legge e restituisce i dati aggiornati
+        return session.exec(select(Player).order_by(Player.points.desc(), Player.name.asc())).all()
+
     except Exception as e:
         session.rollback()
-        # Stampa l'errore reale nel terminale per il debug
-        print(f"ERROR recompute on leaderboard: {repr(e)}")
-        raise HTTPException(status_code=500, detail="Leaderboard recompute failed")
+        # **GUARDA IL TERMINALE PER QUESTO ERRORE**
+        print(f"FATAL ERROR on /leaderboard: {repr(e)}")
+        raise HTTPException(status_code=500, detail="Failed to recompute leaderboard.")
 
-    return session.exec(select(Player).order_by(Player.points.desc(), Player.name.asc())).all()
-
-
-# ========== MATCHES ==========
+# ========== MATCHES (MODIFICATO) ==========
 
 class MatchIn(SQLModel):
     teamA_attacker_id: int
@@ -200,39 +227,29 @@ def list_matches(session: Session = Depends(get_session)):
 
 @app.post("/matches", response_model=Match)
 def create_match(data: MatchIn, session: Session = Depends(get_session)):
+    # ... (logica per calcolare winner e awarded, rimane invariata) ...
     ids = [
         data.teamA_attacker_id, data.teamA_goalkeeper_id,
         data.teamB_attacker_id, data.teamB_goalkeeper_id,
     ]
-    players = {
-        p.id: p
-        for p in session.exec(select(Player).where(Player.id.in_(ids))).all()
-    }
-    if len(players) != 4:
+    players_check = session.exec(select(Player).where(Player.id.in_(ids))).all()
+    if len(players_check) != 4:
         raise HTTPException(status_code=400, detail="Giocatori non validi")
 
     winner = "A" if data.score_a > data.score_b else "B"
-    teamA = [players[data.teamA_attacker_id], players[data.teamA_goalkeeper_id]]
-    teamB = [players[data.teamB_attacker_id], players[data.teamB_goalkeeper_id]]
-
     cappotto = (data.score_a == 6 and data.score_b == 0) or (data.score_a == 0 and data.score_b == 6)
-    awarded: Dict[int, int] = {}
-
+    awarded = {}
+    
+    # Questo calcolo serve solo per il campo `points_awarded` nel JSON del match
     if winner == "A":
-        win_team, lose_team = teamA, teamB
+        awarded.update({p_id: (4 if cappotto else 3) for p_id in [data.teamA_attacker_id, data.teamA_goalkeeper_id]})
+        awarded.update({p_id: (-1 if cappotto else 1) for p_id in [data.teamB_attacker_id, data.teamB_goalkeeper_id]})
     else:
-        win_team, lose_team = teamB, teamA
+        awarded.update({p_id: (4 if cappotto else 3) for p_id in [data.teamB_attacker_id, data.teamB_goalkeeper_id]})
+        awarded.update({p_id: (-1 if cappotto else 1) for p_id in [data.teamA_attacker_id, data.teamA_goalkeeper_id]})
 
-    if cappotto:
-        for p in win_team:
-            awarded[p.id] = 4
-        for p in lose_team:
-            awarded[p.id] = -1
-    else:
-        for p in win_team:
-            awarded[p.id] = 3
-        for p in lose_team:
-            awarded[p.id] = 1
+    # L'aggiornamento incrementale dei punti è RIMOSSO.
+    # La classifica farà il ricalcolo completo.
 
     m = Match(
         teamA_attacker_id=data.teamA_attacker_id,
@@ -248,7 +265,6 @@ def create_match(data: MatchIn, session: Session = Depends(get_session)):
     session.add(m)
     session.commit()
     session.refresh(m)
-
     return m
 
 @app.delete("/matches/{match_id}")
@@ -257,18 +273,12 @@ def delete_match(match_id: int, session: Session = Depends(get_session)):
     if not m:
         raise HTTPException(status_code=404, detail="Match not found")
     session.delete(m)
+    # Non è più necessario ricalcolare qui, lo farà la prossima chiamata a /leaderboard
     session.commit()
-
-    try:
-        recompute_players_points_tx(session)
-        session.commit()
-    except Exception as e:
-        session.rollback()
-        print(f"ERROR recompute after delete_match: {repr(e)}")
-
     return {"status": "ok"}
 
-# ========== ADMIN ==========
+# ========== ADMIN (invariato) ==========
+# ... (le funzioni admin rimangono invariate) ...
 
 @app.post("/admin/reset")
 def admin_reset(session: Session = Depends(get_session)):
