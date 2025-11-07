@@ -44,13 +44,13 @@ def healthz(session: Session = Depends(get_session)):
     except Exception:
         return {"ok": True, "db": "down"}
 
-# ========== UTILS RICALCOLO PUNTI (CON NOMI COLONNE MINUSCOLI) ==========
+# ========== UTILS RICALCOLO PUNTI (VERSIONE FINALE) ==========
 def recompute_players_points_tx(session: Session):
     """
-    Ricostruisce i punti dei giocatori con una singola, efficiente query SQL,
-    usando i nomi delle colonne corretti (minuscoli).
+    Ricostruisce i punti con una singola query SQL efficiente,
+    usando i nomi di colonna corretti (con maiuscole e virgolette).
     """
-    recompute_query = text("""
+    recompute_query = text('''
         WITH player_points AS (
             SELECT
                 player_id,
@@ -61,10 +61,10 @@ def recompute_players_points_tx(session: Session):
                     ELSE 1
                 END AS points
             FROM (
-                SELECT id, teama_attacker_id AS player_id, 'A' AS team, score_a, score_b FROM match UNION ALL
-                SELECT id, teama_goalkeeper_id AS player_id, 'A' AS team, score_a, score_b FROM match UNION ALL
-                SELECT id, teamb_attacker_id AS player_id, 'B' AS team, score_a, score_b FROM match UNION ALL
-                SELECT id, teamb_goalkeeper_id AS player_id, 'B' AS team, score_a, score_b FROM match
+                SELECT id, "teamA_attacker_id" AS player_id, 'A' AS team, score_a, score_b FROM match UNION ALL
+                SELECT id, "teamA_goalkeeper_id" AS player_id, 'A' AS team, score_a, score_b FROM match UNION ALL
+                SELECT id, "teamB_attacker_id" AS player_id, 'B' AS team, score_a, score_b FROM match UNION ALL
+                SELECT id, "teamB_goalkeeper_id" AS player_id, 'B' AS team, score_a, score_b FROM match
             ) AS unnested_matches
         ),
         total_points AS (
@@ -76,15 +76,12 @@ def recompute_players_points_tx(session: Session):
         SET points = COALESCE(tp.total, 0)
         FROM total_points tp
         WHERE p.id = tp.player_id;
-    """)
+    ''')
     
-    # Azzera i punti di tutti prima di ricalcolare
     session.exec(text("UPDATE player SET points = 0"))
-    
-    # Esegui la query di ricalcolo
     session.exec(recompute_query)
 
-# ========== PLAYERS (invariato) ==========
+# ========== PLAYERS ==========
 @app.post("/players", response_model=Player)
 async def create_player(
     name: str = Form(...),
@@ -137,12 +134,12 @@ def leaderboard(session: Session = Depends(get_session)):
         print(f"FATAL ERROR on /leaderboard: {repr(e)}")
         raise HTTPException(status_code=500, detail="Failed to recompute leaderboard.")
 
-# ========== MATCHES (CON NOMI COLONNE MINUSCOLI) ==========
+# ========== MATCHES ==========
 class MatchIn(SQLModel):
-    teama_attacker_id: int
-    teama_goalkeeper_id: int
-    teamb_attacker_id: int
-    teamb_goalkeeper_id: int
+    teamA_attacker_id: int
+    teamA_goalkeeper_id: int
+    teamB_attacker_id: int
+    teamB_goalkeeper_id: int
     score_a: int
     score_b: int
 
@@ -153,8 +150,8 @@ def list_matches(session: Session = Depends(get_session)):
 @app.post("/matches", response_model=Match)
 def create_match(data: MatchIn, session: Session = Depends(get_session)):
     ids = [
-        data.teama_attacker_id, data.teama_goalkeeper_id,
-        data.teamb_attacker_id, data.teamb_goalkeeper_id,
+        data.teamA_attacker_id, data.teamA_goalkeeper_id,
+        data.teamB_attacker_id, data.teamB_goalkeeper_id,
     ]
     players_check = session.exec(select(Player).where(Player.id.in_(ids))).all()
     if len(players_check) != 4:
@@ -165,17 +162,17 @@ def create_match(data: MatchIn, session: Session = Depends(get_session)):
     awarded = {}
     
     if winner == "A":
-        awarded.update({p_id: (4 if cappotto else 3) for p_id in [data.teama_attacker_id, data.teama_goalkeeper_id]})
-        awarded.update({p_id: (-1 if cappotto else 1) for p_id in [data.teamb_attacker_id, data.teamb_goalkeeper_id]})
+        awarded.update({str(p_id): (4 if cappotto else 3) for p_id in [data.teamA_attacker_id, data.teamA_goalkeeper_id]})
+        awarded.update({str(p_id): (-1 if cappotto else 1) for p_id in [data.teamB_attacker_id, data.teamB_goalkeeper_id]})
     else:
-        awarded.update({p_id: (4 if cappotto else 3) for p_id in [data.teamb_attacker_id, data.teamb_goalkeeper_id]})
-        awarded.update({p_id: (-1 if cappotto else 1) for p_id in [data.teama_attacker_id, data.teama_goalkeeper_id]})
+        awarded.update({str(p_id): (4 if cappotto else 3) for p_id in [data.teamB_attacker_id, data.teamB_goalkeeper_id]})
+        awarded.update({str(p_id): (-1 if cappotto else 1) for p_id in [data.teamA_attacker_id, data.teamA_goalkeeper_id]})
 
     m = Match(
-        teama_attacker_id=data.teama_attacker_id,
-        teama_goalkeeper_id=data.teama_goalkeeper_id,
-        teamb_attacker_id=data.teamb_attacker_id,
-        teamb_goalkeeper_id=data.teamb_goalkeeper_id,
+        teamA_attacker_id=data.teamA_attacker_id,
+        teamA_goalkeeper_id=data.teamA_goalkeeper_id,
+        teamB_attacker_id=data.teamB_attacker_id,
+        teamB_goalkeeper_id=data.teamB_goalkeeper_id,
         score_a=data.score_a,
         score_b=data.score_b,
         winner_team=winner,
@@ -194,10 +191,9 @@ def delete_match(match_id: int, session: Session = Depends(get_session)):
         raise HTTPException(status_code=404, detail="Match not found")
     session.delete(m)
     session.commit()
-    # Il ricalcolo non è necessario qui, avverrà alla prossima chiamata a /leaderboard
     return {"status": "ok"}
 
-# ========== ADMIN (assicurati che usi i nomi corretti) ==========
+# ========== ADMIN ==========
 @app.post("/admin/reset")
 def admin_reset(session: Session = Depends(get_session)):
     session.exec(text("DELETE FROM match"))
