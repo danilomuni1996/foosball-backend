@@ -49,77 +49,52 @@ def healthz(session: Session = Depends(get_session)):
 
 def recompute_players_points_tx(session: Session):
     """
-    Ricostruisce Player.points in base alle partite presenti in matches,
-    applicando la regola:
-      - cappotto 6-0: vincenti +4, perdenti -1
-      - vittoria normale: vincenti +3
-      - sconfitta normale: +1 ai perdenti
+    Ricostruisce Player.points in base alle partite presenti in matches.
+    Questa versione usa SQL compatibile sia con PostgreSQL che con SQLite.
     """
-    # 1) azzera
+    # 1) azzera i punti di tutti i giocatori
     session.exec(text("UPDATE players SET points = 0"))
 
-    # 2) cappotto 6-0 vinto da Team A: +4 ai due di A, -1 ai due di B
+    # 2) assegna i punti per le vittorie "cappotto" (6-0 o 0-6)
+    # +4 ai vincenti
     session.exec(text("""
-        UPDATE players p
-        SET points = p.points + 4
-        FROM matches m
-        WHERE m.score_a = 6 AND m.score_b = 0
-          AND p.id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id)
+        UPDATE players SET points = points + 4 WHERE id IN (
+            SELECT teamA_attacker_id FROM matches WHERE score_a = 6 AND score_b = 0 UNION ALL
+            SELECT teamA_goalkeeper_id FROM matches WHERE score_a = 6 AND score_b = 0 UNION ALL
+            SELECT teamB_attacker_id FROM matches WHERE score_b = 6 AND score_a = 0 UNION ALL
+            SELECT teamB_goalkeeper_id FROM matches WHERE score_b = 6 AND score_a = 0
+        )
     """))
+    # -1 ai perdenti
     session.exec(text("""
-        UPDATE players p
-        SET points = p.points - 1
-        FROM matches m
-        WHERE m.score_a = 6 AND m.score_b = 0
-          AND p.id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id)
-    """))
-
-    # 3) cappotto 0-6 vinto da Team B: +4 ai due di B, -1 ai due di A
-    session.exec(text("""
-        UPDATE players p
-        SET points = p.points + 4
-        FROM matches m
-        WHERE m.score_b = 6 AND m.score_a = 0
-          AND p.id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id)
-    """))
-    session.exec(text("""
-        UPDATE players p
-        SET points = p.points - 1
-        FROM matches m
-        WHERE m.score_b = 6 AND m.score_a = 0
-          AND p.id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id)
+        UPDATE players SET points = points - 1 WHERE id IN (
+            SELECT teamB_attacker_id FROM matches WHERE score_a = 6 AND score_b = 0 UNION ALL
+            SELECT teamB_goalkeeper_id FROM matches WHERE score_a = 6 AND score_b = 0 UNION ALL
+            SELECT teamA_attacker_id FROM matches WHERE score_b = 6 AND score_a = 0 UNION ALL
+            SELECT teamA_goalkeeper_id FROM matches WHERE score_b = 6 AND score_a = 0
+        )
     """))
 
-    # 4) vittorie normali: +3 ai vincenti
+    # 3) assegna punti per vittorie normali (non cappotto)
+    # +3 ai vincenti
     session.exec(text("""
-        UPDATE players p
-        SET points = p.points + 3
-        FROM matches m
-        WHERE m.score_a > m.score_b
-          AND p.id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id)
-    """))
-    session.exec(text("""
-        UPDATE players p
-        SET points = p.points + 3
-        FROM matches m
-        WHERE m.score_b > m.score_a
-          AND p.id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id)
+        UPDATE players SET points = points + 3 WHERE id IN (
+            SELECT teamA_attacker_id FROM matches WHERE score_a > score_b AND score_a != 6 UNION ALL
+            SELECT teamA_goalkeeper_id FROM matches WHERE score_a > score_b AND score_a != 6 UNION ALL
+            SELECT teamB_attacker_id FROM matches WHERE score_b > score_a AND score_b != 6 UNION ALL
+            SELECT teamB_goalkeeper_id FROM matches WHERE score_b > score_a AND score_b != 6
+        )
     """))
 
-    # 5) sconfitte normali: +1 ai perdenti
+    # 4) assegna punti per sconfitte normali (non cappotto)
+    # +1 ai perdenti
     session.exec(text("""
-        UPDATE players p
-        SET points = p.points + 1
-        FROM matches m
-        WHERE m.score_a < m.score_b
-          AND p.id IN (m.teamA_attacker_id, m.teamA_goalkeeper_id)
-    """))
-    session.exec(text("""
-        UPDATE players p
-        SET points = p.points + 1
-        FROM matches m
-        WHERE m.score_b < m.score_a
-          AND p.id IN (m.teamB_attacker_id, m.teamB_goalkeeper_id)
+        UPDATE players SET points = points + 1 WHERE id IN (
+            SELECT teamB_attacker_id FROM matches WHERE score_a > score_b AND score_a != 6 UNION ALL
+            SELECT teamB_goalkeeper_id FROM matches WHERE score_a > score_b AND score_a != 6 UNION ALL
+            SELECT teamA_attacker_id FROM matches WHERE score_b > score_a AND score_b != 6 UNION ALL
+            SELECT teamA_goalkeeper_id FROM matches WHERE score_b > score_a AND score_b != 6
+        )
     """))
 
 # ========== PLAYERS ==========
@@ -197,17 +172,15 @@ def delete_player_by_name(
 
 @app.get("/leaderboard", response_model=List[Player])
 def leaderboard(session: Session = Depends(get_session)):
-    # Forza il ricalcolo completo dei punti di tutti i giocatori
-    # basandosi sullo storico delle partite.
     try:
         recompute_players_points_tx(session)
         session.commit()
     except Exception as e:
         session.rollback()
-        print("ERROR recompute on leaderboard:", repr(e))
+        # Stampa l'errore reale nel terminale per il debug
+        print(f"ERROR recompute on leaderboard: {repr(e)}")
         raise HTTPException(status_code=500, detail="Leaderboard recompute failed")
 
-    # Ora la funzione legge i punti appena aggiornati, garantendo che siano corretti.
     return session.exec(select(Player).order_by(Player.points.desc(), Player.name.asc())).all()
 
 
@@ -261,9 +234,6 @@ def create_match(data: MatchIn, session: Session = Depends(get_session)):
         for p in lose_team:
             awarded[p.id] = 1
 
-    # L'aggiornamento incrementale dei punti è stato rimosso.
-    # Il ricalcolo completo viene fatto dall'endpoint /leaderboard.
-
     m = Match(
         teamA_attacker_id=data.teamA_attacker_id,
         teamA_goalkeeper_id=data.teamA_goalkeeper_id,
@@ -289,13 +259,12 @@ def delete_match(match_id: int, session: Session = Depends(get_session)):
     session.delete(m)
     session.commit()
 
-    # DOPO cancellazione ricalcola sempre per rimuovere l’effetto del match eliminato
     try:
         recompute_players_points_tx(session)
         session.commit()
     except Exception as e:
         session.rollback()
-        print("ERROR recompute after delete_match:", repr(e))
+        print(f"ERROR recompute after delete_match: {repr(e)}")
 
     return {"status": "ok"}
 
@@ -303,15 +272,9 @@ def delete_match(match_id: int, session: Session = Depends(get_session)):
 
 @app.post("/admin/reset")
 def admin_reset(session: Session = Depends(get_session)):
-    # elimina tutte le partite
-    for m in session.exec(select(Match)).all():
-        session.delete(m)
-    session.commit()
-
-    # azzera i punti dei giocatori (nessuna partita rimasta)
+    session.exec(text("DELETE FROM matches"))
     session.exec(text("UPDATE players SET points = 0"))
     session.commit()
-
     return {"players": session.exec(select(func.count(Player.id))).one(), "matches": 0}
 
 @app.post("/admin/recompute-leaderboard")
@@ -322,5 +285,5 @@ def recompute_leaderboard(session: Session = Depends(get_session)):
         return {"status": "ok"}
     except Exception as e:
         session.rollback()
-        print("ERROR recompute (manual):", repr(e))
+        print(f"ERROR recompute (manual): {repr(e)}")
         raise HTTPException(status_code=500, detail="Recompute failed")
