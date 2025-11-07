@@ -5,7 +5,7 @@ from sqlmodel import Session, select, SQLModel
 from typing import Optional, List, Dict
 from pathlib import Path
 from models import Player, Match
-from db import init_db, engine  # db.py configurato con pool_pre_ping e sslmode=require
+from db import init_db, engine
 import json
 from sqlalchemy import func, text
 from datetime import datetime
@@ -27,7 +27,6 @@ app.mount("/static", StaticFiles(directory=str(UPLOAD_DIR)), name="static")
 
 @app.on_event("startup")
 def on_startup():
-    # Evita accesso DB in avvio (Neon può essere idle/saturo). Se serve, chiama init_db(lazy=False) da endpoint admin.
     pass
 
 def get_session():
@@ -38,7 +37,6 @@ def get_session():
 def root():
     return {"ok": True}
 
-# Healthcheck che non fa fallire il pod
 @app.get("/healthz")
 def healthz(session: Session = Depends(get_session)):
     try:
@@ -57,9 +55,6 @@ def recompute_players_points_tx(session: Session):
       - vittoria normale: vincenti +3
       - sconfitta normale: +1 ai perdenti
     """
-    # Assicurati che la colonna points esista (eseguire una tantum se manca):
-    # ALTER TABLE players ADD COLUMN points INTEGER NOT NULL DEFAULT 0;
-
     # 1) azzera
     session.exec(text("UPDATE players SET points = 0"))
 
@@ -202,8 +197,19 @@ def delete_player_by_name(
 
 @app.get("/leaderboard", response_model=List[Player])
 def leaderboard(session: Session = Depends(get_session)):
-    # legge direttamente da players ordinando per points
+    # Forza il ricalcolo completo dei punti di tutti i giocatori
+    # basandosi sullo storico delle partite.
+    try:
+        recompute_players_points_tx(session)
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        print("ERROR recompute on leaderboard:", repr(e))
+        raise HTTPException(status_code=500, detail="Leaderboard recompute failed")
+
+    # Ora la funzione legge i punti appena aggiornati, garantendo che siano corretti.
     return session.exec(select(Player).order_by(Player.points.desc(), Player.name.asc())).all()
+
 
 # ========== MATCHES ==========
 
@@ -255,10 +261,8 @@ def create_match(data: MatchIn, session: Session = Depends(get_session)):
         for p in lose_team:
             awarded[p.id] = 1
 
-    # opzionale: puoi rimuovere gli incrementi immediati se preferisci solo il ricalcolo globale
-    for pid, pts in awarded.items():
-        players[pid].points += pts
-    session.add_all(players.values())
+    # L'aggiornamento incrementale dei punti è stato rimosso.
+    # Il ricalcolo completo viene fatto dall'endpoint /leaderboard.
 
     m = Match(
         teamA_attacker_id=data.teamA_attacker_id,
@@ -274,14 +278,6 @@ def create_match(data: MatchIn, session: Session = Depends(get_session)):
     session.add(m)
     session.commit()
     session.refresh(m)
-
-    # ricalcolo completo opzionale anche qui (puoi commentare se tieni gli incrementi immediati)
-    # try:
-    #     recompute_players_points_tx(session)
-    #     session.commit()
-    # except Exception as e:
-    #     session.rollback()
-    #     print("ERROR recompute after create_match:", repr(e))
 
     return m
 
@@ -318,7 +314,6 @@ def admin_reset(session: Session = Depends(get_session)):
 
     return {"players": session.exec(select(func.count(Player.id))).one(), "matches": 0}
 
-# Endpoint per ricalcolo manuale completo (utile dopo import massivi)
 @app.post("/admin/recompute-leaderboard")
 def recompute_leaderboard(session: Session = Depends(get_session)):
     try:
